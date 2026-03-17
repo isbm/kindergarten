@@ -172,7 +172,7 @@ impl Kindergarten {
             .try_wait()
             .map(|x| x.is_some_and(|s| s.success()));
 
-        if matches!(success, Ok(true) | Ok(false)) {
+        if success.is_ok() {
             self.remove(t);
         }
 
