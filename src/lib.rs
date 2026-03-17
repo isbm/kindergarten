@@ -1,7 +1,7 @@
 #[cfg(feature = "actix")]
 pub mod actix;
 
-use dashmap::{DashMap, Entry, mapref::one::Ref};
+use dashmap::{DashMap, Entry};
 #[cfg(unix)]
 use nix::{
     sys::signal::{self, Signal},
@@ -106,6 +106,13 @@ impl Kindergarten {
         self.access.get(&t).map(|k| k.value().clone())
     }
 
+    /// Removes a child handle from the garden.
+    ///
+    /// Dropping the returned [`Kind`] closes any still-owned stdio pipe handles.
+    pub fn remove(&self, t: Ticket) -> Option<Kind> {
+        self.access.remove(&t).map(|(_, kind)| kind)
+    }
+
     /// Gets a handle to a child instance, streams must be locked separately to use
     ///
     /// Directly using the getters for streams is slightly more efficient
@@ -138,32 +145,38 @@ impl Kindergarten {
     }
 
     pub async fn has_terminated(&self, t: Ticket) -> Option<bool> {
-        match self.access.get(&t) {
-            Some(x) => Some(
-                x.inner
-                    .inner
-                    .lock()
-                    .await
-                    .try_wait()
-                    .map(|x| x.is_some())
-                    .unwrap_or_default(),
-            ),
-            None => None,
+        let kind = self.get(t)?;
+        let has_terminated = kind
+            .inner
+            .inner
+            .lock()
+            .await
+            .try_wait()
+            .map(|x| x.is_some())
+            .unwrap_or_default();
+
+        if has_terminated {
+            self.remove(t);
         }
+
+        Some(has_terminated)
     }
 
     pub async fn success(&self, t: Ticket) -> Option<std::io::Result<bool>> {
-        match self.access.get(&t) {
-            Some(x) => Some(
-                x.inner
-                    .inner
-                    .lock()
-                    .await
-                    .try_wait()
-                    .map(|x| x.is_some_and(|s| s.success())),
-            ),
-            None => None,
+        let kind = self.get(t)?;
+        let success = kind
+            .inner
+            .inner
+            .lock()
+            .await
+            .try_wait()
+            .map(|x| x.is_some_and(|s| s.success()));
+
+        if matches!(success, Ok(true) | Ok(false)) {
+            self.remove(t);
         }
+
+        Some(success)
     }
 
     #[cfg(unix)]
@@ -197,22 +210,21 @@ impl Kindergarten {
     }
 
     pub async fn kill(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
-        match self.access.get(&t) {
-            Some(c) => Some(Self::_kill(c).await),
-            None => None,
+        let kind = self.get(t)?;
+        let mut m = kind.inner.inner.lock().await;
+        if let Err(err) = m.start_kill() {
+            return Some(Err(err));
         }
-    }
-
-    async fn _kill(c: Ref<'_, Ticket, Kind>) -> std::io::Result<ExitStatus> {
-        let mut m = c.inner.inner.lock().await;
-        m.start_kill()?;
-        m.wait().await
+        let status = m.wait().await;
+        drop(m);
+        self.remove(t);
+        Some(status)
     }
 
     pub async fn wait(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
-        match self.access.get(&t) {
-            Some(c) => Some(c.inner.inner.lock().await.wait().await),
-            None => None,
-        }
+        let kind = self.get(t)?;
+        let status = kind.inner.inner.lock().await.wait().await;
+        self.remove(t);
+        Some(status)
     }
 }
