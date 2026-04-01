@@ -20,7 +20,35 @@ use uuid::Uuid;
 
 #[derive(Default)]
 pub struct Kindergarten {
-    access: DashMap<Ticket, Kind>,
+    access: DashMap<Ticket, MaybeChild>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MaybeChild {
+    Kind(Kind),
+    Tombstone(ExitStatus),
+}
+
+impl MaybeChild {
+    fn child(&self) -> Option<&Kind> {
+        match self {
+            MaybeChild::Kind(kind) => Some(kind),
+            MaybeChild::Tombstone(_) => None,
+        }
+    }
+
+    fn into_child(self) -> Option<Kind> {
+        match self {
+            MaybeChild::Kind(kind) => Some(kind),
+            MaybeChild::Tombstone(_) => None,
+        }
+    }
+}
+
+impl From<Kind> for MaybeChild {
+    fn from(value: Kind) -> Self {
+        Self::Kind(value)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +123,7 @@ impl Serialize for Ticket {
 impl Kindergarten {
     pub async fn spawn(&self, cmd: Command) -> Result<Ticket, std::io::Error> {
         let ticket = Ticket(Uuid::new_v4());
-        self.access.insert(ticket, Kind::new(cmd)?);
+        self.access.insert(ticket, Kind::new(cmd)?.into());
         Ok(ticket)
     }
 
@@ -103,43 +131,52 @@ impl Kindergarten {
     ///
     /// Directly using the getters for streams is slightly more efficient
     pub fn get(&self, t: Ticket) -> Option<Kind> {
-        self.access.get(&t).map(|k| k.value().clone())
+        self.access.get(&t).and_then(|k| k.child().cloned())
     }
 
     /// Removes a child handle from the garden.
     ///
     /// Dropping the returned [`Kind`] closes any still-owned stdio pipe handles.
     pub fn remove(&self, t: Ticket) -> Option<Kind> {
-        self.access.remove(&t).map(|(_, kind)| kind)
+        self.access
+            .remove(&t)
+            .and_then(|(_, kind)| kind.into_child())
     }
 
     /// Gets a handle to a child instance, streams must be locked separately to use
     ///
     /// Directly using the getters for streams is slightly more efficient
-    pub fn get_or_insert_with(&self, t: Ticket, f: impl Fn() -> Command) -> std::io::Result<Kind> {
+    pub fn get_or_insert_with(
+        &self,
+        t: Ticket,
+        f: impl Fn() -> Command,
+    ) -> std::io::Result<MaybeChild> {
         Ok(match self.access.entry(t) {
             Entry::Occupied(occupied_entry) => occupied_entry.get().clone(),
-            Entry::Vacant(vacant_entry) => vacant_entry.insert(Kind::new((f)())?).value().clone(),
+            Entry::Vacant(vacant_entry) => vacant_entry
+                .insert(Kind::new((f)())?.into())
+                .value()
+                .clone(),
         })
     }
 
     pub async fn stdin(&self, t: Ticket) -> Option<OwnedMutexGuard<ChildStdin>> {
         match self.access.get(&t) {
-            Some(child) => Some(child.inner.stdin.clone().lock_owned().await),
+            Some(child) => Some(child.child()?.inner.stdin.clone().lock_owned().await),
             None => None,
         }
     }
 
     pub async fn stdout(&self, t: Ticket) -> Option<OwnedMutexGuard<ChildStdout>> {
         match self.access.get(&t) {
-            Some(child) => Some(child.inner.stdout.clone().lock_owned().await),
+            Some(child) => Some(child.child()?.inner.stdout.clone().lock_owned().await),
             None => None,
         }
     }
 
     pub async fn stderr(&self, t: Ticket) -> Option<OwnedMutexGuard<ChildStderr>> {
         match self.access.get(&t) {
-            Some(child) => Some(child.inner.stderr.clone().lock_owned().await),
+            Some(child) => Some(child.child()?.inner.stderr.clone().lock_owned().await),
             None => None,
         }
     }
@@ -183,6 +220,7 @@ impl Kindergarten {
     pub async fn pid(&self, t: Ticket) -> Option<Pid> {
         self.access
             .get(&t)?
+            .child()?
             .inner
             .inner
             .lock()
@@ -193,38 +231,59 @@ impl Kindergarten {
     }
 
     #[cfg(unix)]
-    /// Send SIGTERM
+    /// Send SIGTERM and wait for the process to terminate
     pub async fn terminate(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
-        self.send_signal(t, Signal::SIGTERM).await
+        self.send_signal_and_wait(t, Signal::SIGTERM).await
+    }
+
+    #[cfg(unix)]
+    /// Send SIGKILL and wait for the process to terminate
+    pub async fn kill(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
+        self.send_signal_and_wait(t, Signal::SIGKILL).await
+    }
+
+    #[cfg(unix)]
+    /// Send SIGINT and wait for the process to terminate
+    pub async fn interrupt(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
+        self.send_signal_and_wait(t, Signal::SIGINT).await
+    }
+
+    #[cfg(unix)]
+    /// Send a signal and wait for the process to terminate
+    pub async fn send_signal_and_wait(
+        &self,
+        t: Ticket,
+        sig: Signal,
+    ) -> Option<std::io::Result<ExitStatus>> {
+        self.send_signal(t, sig).await;
+        self.wait(t).await
     }
 
     #[cfg(unix)]
     /// Send an arbitrarry unix signal
-    pub async fn send_signal(&self, t: Ticket, sig: Signal) -> Option<std::io::Result<ExitStatus>> {
-        if let Err(err) = signal::kill(self.pid(t).await?, sig)
-            .map_err(|erno| std::io::Error::from_raw_os_error(erno as i32))
-        {
-            return Some(Err(err));
-        }
-        self.wait(t).await
-    }
+    pub async fn send_signal(&self, t: Ticket, sig: Signal) -> Option<std::io::Result<()>> {
+        let result = signal::kill(self.pid(t).await?, sig)
+            .map_err(|erno| std::io::Error::from_raw_os_error(erno as i32));
 
-    pub async fn kill(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
-        let kind = self.get(t)?;
-        let mut m = kind.inner.inner.lock().await;
-        if let Err(err) = m.start_kill() {
-            return Some(Err(err));
+        match result {
+            Err(err) => return Some(Err(err)),
+            Ok(_) => Some(Ok(())),
         }
-        let status = m.wait().await;
-        drop(m);
-        self.remove(t);
-        Some(status)
     }
 
     pub async fn wait(&self, t: Ticket) -> Option<std::io::Result<ExitStatus>> {
-        let kind = self.get(t)?;
-        let status = kind.inner.inner.lock().await.wait().await;
-        self.remove(t);
+        let mut slot = self.access.get_mut(&t)?;
+        let status = match &*slot {
+            MaybeChild::Kind(kind) => {
+                let status = kind.inner.inner.lock().await.wait().await;
+                if let Ok(status) = status {
+                    *slot = MaybeChild::Tombstone(status);
+                }
+                status
+            }
+            MaybeChild::Tombstone(exit_status) => Ok(*exit_status),
+        };
+
         Some(status)
     }
 }

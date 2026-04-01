@@ -108,7 +108,11 @@ async fn assert_pipe_fds_eventually(expected: usize, context: &str) -> io::Resul
     }
 }
 
-async fn spawn_many(garden: &Kindergarten, count: usize, command: fn() -> Command) -> io::Result<Vec<kindergarten::Ticket>> {
+async fn spawn_many(
+    garden: &Kindergarten,
+    count: usize,
+    command: fn() -> Command,
+) -> io::Result<Vec<kindergarten::Ticket>> {
     let mut tickets = Vec::with_capacity(count);
     for _ in 0..count {
         tickets.push(garden.spawn(command()).await?);
@@ -134,7 +138,10 @@ async fn exact_pipe_accounting_for_live_children_and_kill_cleanup() -> io::Resul
     for ticket in tickets {
         let garden = Arc::clone(&garden);
         kill_set.spawn(async move {
-            let status = garden.kill(ticket).await.expect("child should exist")?;
+            let status = garden
+                .terminate(ticket)
+                .await
+                .expect("child should exist")?;
             assert!(
                 garden.get(ticket).is_none(),
                 "child was not removed from the garden after kill"
@@ -176,7 +183,10 @@ async fn concurrent_mixed_completion_paths_never_leave_residual_pipes() -> io::R
                         let status = garden.wait(ticket).await.expect("child should exist")?;
                         assert!(status.success(), "waited child exited unsuccessfully");
                         drop(leaked_clone);
-                        assert!(garden.get(ticket).is_none(), "child should be removed after wait");
+                        assert!(
+                            garden.get(ticket).is_none(),
+                            "child should be removed after wait"
+                        );
                     }
                     1 => {
                         let ticket = garden.spawn(delayed_exit_command()).await?;
@@ -197,9 +207,15 @@ async fn concurrent_mixed_completion_paths_never_leave_residual_pipes() -> io::R
                         let ticket = garden.spawn(long_lived_command()).await?;
                         let leaked_clone = garden.get(ticket).expect("child should exist");
                         sleep(Duration::from_millis(10)).await;
-                        let _status = garden.kill(ticket).await.expect("child should exist")?;
+                        let _status = garden
+                            .terminate(ticket)
+                            .await
+                            .expect("child should exist")?;
                         drop(leaked_clone);
-                        assert!(garden.get(ticket).is_none(), "child should be removed after kill");
+                        assert!(
+                            garden.get(ticket).is_none(),
+                            "child should be removed after kill"
+                        );
                     }
                 }
 
@@ -230,8 +246,14 @@ async fn rapid_spawn_wait_cycles_return_to_exact_baseline_every_time() -> io::Re
     for iteration in 0..128usize {
         let ticket = garden.spawn(quick_exit_command()).await?;
         let status = garden.wait(ticket).await.expect("child should exist")?;
-        assert!(status.success(), "child exited unsuccessfully at iteration {iteration}");
-        assert!(garden.get(ticket).is_none(), "child was not removed after wait");
+        assert!(
+            status.success(),
+            "child exited unsuccessfully at iteration {iteration}"
+        );
+        assert!(
+            garden.get(ticket).is_none(),
+            "child was not removed after wait"
+        );
         assert_pipe_fds_eventually(baseline, &format!("rapid iteration {iteration}")).await?;
     }
 
