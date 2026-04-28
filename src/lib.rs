@@ -146,16 +146,20 @@ impl Kindergarten {
     /// Gets a handle to a child instance, streams must be locked separately to use
     ///
     /// Directly using the getters for streams is slightly more efficient
-    pub fn get_or_insert_with(
-        &self,
-        t: Ticket,
-        f: impl Fn() -> Command,
-    ) -> std::io::Result<MaybeChild> {
+    pub fn get_or_insert_with(&self, t: Ticket, f: impl Fn() -> Command) -> std::io::Result<Kind> {
         Ok(match self.access.entry(t) {
-            Entry::Occupied(occupied_entry) => occupied_entry.get().clone(),
+            Entry::Occupied(mut occupied_entry) => match occupied_entry.get() {
+                MaybeChild::Kind(kind) => kind.clone(),
+                MaybeChild::Tombstone(_) => occupied_entry
+                    .insert(Kind::new((f)())?.into())
+                    .child()
+                    .unwrap()
+                    .clone(),
+            },
             Entry::Vacant(vacant_entry) => vacant_entry
                 .insert(Kind::new((f)())?.into())
-                .value()
+                .child()
+                .unwrap()
                 .clone(),
         })
     }

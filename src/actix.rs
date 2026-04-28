@@ -40,7 +40,7 @@ where
     T: 'static,
     <T as FromRequest>::Error: std::error::Error + 'static,
 {
-    type Error = Box<(dyn std::error::Error + 'static)>;
+    type Error = Box<dyn std::error::Error + 'static>;
 
     type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
 
